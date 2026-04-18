@@ -5,25 +5,26 @@ import { initDB } from './db'
 import { paymentRoutes } from './routes/payments'
 import { merchantRoutes } from './routes/merchants'
 import { webhookRoutes } from './routes/webhooks'
+import { swapWorker } from './services/swapWorker'
 
 dotenv.config()
 
 const app = Fastify({ logger: true })
 
 async function main() {
-  // Plugins
   await app.register(cors, { origin: '*' })
 
-  // Routes
   await app.register(paymentRoutes, { prefix: '/api' })
   await app.register(merchantRoutes, { prefix: '/api' })
   await app.register(webhookRoutes)
 
-  // Health check
   app.get('/health', async () => ({ status: 'ok', network: process.env.SOLANA_NETWORK }))
 
-  // Init DB schema
   await initDB()
+
+  // Start the swap worker
+  console.log('✅ Swap worker started')
+  // swapWorker is imported and starts automatically on import
 
   const port = Number(process.env.PORT) || 3000
   await app.listen({ port, host: '0.0.0.0' })

@@ -1,58 +1,87 @@
 import { FastifyInstance } from 'fastify'
 import { pool } from '../db'
+import { swapQueue } from '../services/swapWorker'
+
+const TOKEN_MINTS: Record<string, string> = {
+  'So11111111111111111111111111111111111111112': 'SOL',
+  'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr': 'USDC',
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'USDT',
+}
 
 export async function webhookRoutes(app: FastifyInstance) {
-
-  // POST /webhooks/helius
-  // Helius calls this when a tx hits one of our deposit addresses
-  // Full swap logic goes here in week 2
   app.post('/webhooks/helius', async (req, reply) => {
     const events = req.body as any[]
-
     if (!Array.isArray(events)) {
       return reply.status(400).send({ error: 'Expected array of events' })
     }
-
     for (const event of events) {
       try {
-        // Helius sends enhanced transaction events
-        // Each event has accountData showing which accounts were affected
-        const affectedAccounts: string[] = event.accountData?.map(
-          (a: any) => a.account
-        ) ?? []
-
-        // Find if any affected account is one of our deposit addresses
-        if (affectedAccounts.length === 0) continue
-
-        const placeholders = affectedAccounts
-          .map((_, i) => `$${i + 1}`)
-          .join(',')
-
-        const result = await pool.query(
-          `SELECT * FROM payments
-           WHERE deposit_address IN (${placeholders})
-           AND status = 'pending'`,
-          affectedAccounts
-        )
-
-        if (result.rows.length === 0) continue
-
-        const payment = result.rows[0]
-
-        // Mark as detected — swap logic plugs in here in week 2
-        await pool.query(
-          "UPDATE payments SET status = 'detected' WHERE id = $1",
-          [payment.id]
-        )
-
-        console.log(`✅ Payment detected: ${payment.id} | order: ${payment.order_id}`)
-        // TODO week 2: enqueue Jupiter swap job here
-
+        await processHeliusEvent(event)
       } catch (err) {
         console.error('Error processing Helius event:', err)
       }
     }
-
     return reply.send({ received: true })
   })
+}
+
+async function processHeliusEvent(event: any) {
+  const accountData: any[] = event.accountData ?? []
+  const tokenTransfers: any[] = event.tokenTransfers ?? []
+  const nativeTransfers: any[] = event.nativeTransfers ?? []
+
+  const affectedAddresses = accountData.map((a: any) => a.account)
+  if (affectedAddresses.length === 0) return
+
+  const placeholders = affectedAddresses.map((_: any, i: number) => `$${i + 1}`).join(',')
+  const result = await pool.query(
+    `SELECT * FROM payments WHERE deposit_address IN (${placeholders}) AND status = 'pending'`,
+    affectedAddresses
+  )
+  if (result.rows.length === 0) return
+
+  const payment = result.rows[0]
+  const depositAddress = payment.deposit_address
+
+  const tokenTransfer = tokenTransfers.find((t: any) => t.toUserAccount === depositAddress)
+  const solTransfer = nativeTransfers.find((t: any) => t.toUserAccount === depositAddress)
+
+  let tokenReceived: string
+  let amountReceived: number
+
+  if (tokenTransfer) {
+    tokenReceived = TOKEN_MINTS[tokenTransfer.mint] ?? tokenTransfer.mint
+    amountReceived = tokenTransfer.tokenAmount
+  } else if (solTransfer) {
+    tokenReceived = 'SOL'
+    amountReceived = solTransfer.amount
+  } else {
+    console.log(`Event for ${depositAddress} but no relevant transfer found`)
+    return
+  }
+
+  console.log(`Payment detected: ${amountReceived} ${tokenReceived} for payment ${payment.id}`)
+
+  await pool.query(
+    `UPDATE payments SET status = 'detected', amount_received = $1, token_received = $2 WHERE id = $3`,
+    [amountReceived, tokenReceived, payment.id]
+  )
+
+  await swapQueue.add(
+    'swap',
+    {
+      paymentId: payment.id,
+      depositAddress: payment.deposit_address,
+      derivationPath: payment.derivation_path,
+      tokenReceived,
+      amountReceived,
+    },
+    {
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 5000 },
+    }
+  )
+
+  console.log(`Swap job enqueued for payment ${payment.id}`)
 }

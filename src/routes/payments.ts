@@ -1,14 +1,12 @@
 import { FastifyInstance } from 'fastify'
-import { v4 as uuidv4 } from 'uuid'
 import { pool } from '../db'
 import { authMiddleware } from '../middleware/auth'
 import { deriveDepositAddress } from '../services/wallet'
+import { registerAddressWithHelius } from '../services/helius'
 import { CreatePaymentBody } from '../types'
 
 export async function paymentRoutes(app: FastifyInstance) {
 
-  // POST /payments/create
-  // Merchant calls this to start a payment session
   app.post<{ Body: CreatePaymentBody }>(
     '/payments/create',
     { preHandler: authMiddleware },
@@ -20,7 +18,6 @@ export async function paymentRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: 'order_id and amount_usdc are required' })
       }
 
-      // Check for duplicate order
       const existing = await pool.query(
         'SELECT id, status FROM payments WHERE merchant_id = $1 AND order_id = $2',
         [merchant.id, order_id]
@@ -33,15 +30,8 @@ export async function paymentRoutes(app: FastifyInstance) {
         })
       }
 
-      // Derive unique deposit address for this merchant+order combo
       const mnemonic = process.env.MASTER_MNEMONIC!
-      const { address, derivationPath } = deriveDepositAddress(
-        mnemonic,
-        merchant.id,
-        order_id
-      )
-
-      // Payment expires in 15 minutes
+      const { address, derivationPath } = deriveDepositAddress(mnemonic, merchant.id, order_id)
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000)
 
       const result = await pool.query(
@@ -54,6 +44,9 @@ export async function paymentRoutes(app: FastifyInstance) {
 
       const payment = result.rows[0]
 
+      // Register this address with Helius so it starts watching it
+      await registerAddressWithHelius(address)
+
       return reply.status(201).send({
         payment_id: payment.id,
         deposit_address: payment.deposit_address,
@@ -65,8 +58,6 @@ export async function paymentRoutes(app: FastifyInstance) {
     }
   )
 
-  // GET /payments/:id
-  // Checkout widget polls this for status
   app.get<{ Params: { id: string } }>(
     '/payments/:id',
     { preHandler: authMiddleware },
@@ -85,12 +76,8 @@ export async function paymentRoutes(app: FastifyInstance) {
 
       const payment = result.rows[0]
 
-      // Auto-expire if past expiry and still pending
       if (payment.status === 'pending' && new Date() > new Date(payment.expires_at)) {
-        await pool.query(
-          "UPDATE payments SET status = 'expired' WHERE id = $1",
-          [payment.id]
-        )
+        await pool.query("UPDATE payments SET status = 'expired' WHERE id = $1", [payment.id])
         payment.status = 'expired'
       }
 
