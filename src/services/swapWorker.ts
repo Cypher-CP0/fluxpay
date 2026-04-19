@@ -2,6 +2,8 @@ import { Worker, Queue } from 'bullmq'
 import { redis } from '../db/redis'
 import { pool } from '../db'
 import { swapToUSDC } from '../services/jupiter'
+import { transferUSDCToMerchant } from '../services/tansfer'
+import { notifyMerchant } from '../services/notify'
 import { unregisterAddressFromHelius } from '../services/helius'
 
 // SOL mint address (for swap input)
@@ -29,7 +31,7 @@ export const swapWorker = new Worker<SwapJobData>(
     'swap',
     async (job) => {
         const { paymentId, depositAddress, derivationPath, tokenReceived, amountReceived } = job.data
-        const network = (process.env.SOLANA_NETWORK as string) || 'devnet'
+        // const network = (process.env.SOLANA_NETWORK as string) || 'devnet'
 
         console.log(`Processing swap job for payment ${paymentId}`)
 
@@ -39,19 +41,49 @@ export const swapWorker = new Worker<SwapJobData>(
             [paymentId]
         )
 
+        const result = await pool.query(
+            `SELECT p.*, m.payout_wallet, m.webhook_url
+            FROM payments p
+            JOIN merchants m ON p.merchant_id = m.id
+            WHERE p.id = $1`,
+            [paymentId]
+        )
+
+        if (result.rows.length === 0) throw new Error('Payment ${paymentId} not found')
+        const payment = result.rows[0]
+
+
         try {
-            let txSignature: string
+            let swapTx: string
+            let usdcAmount: number
 
             if (tokenReceived === 'USDC') {
                 // User paid directly in USDC — no swap needed
                 // TODO: just transfer to merchant payout wallet
                 // For now mark as completed
-                console.log(`Payment ${paymentId} received in USDC directly, no swap needed`)
-                txSignature = 'direct_usdc_no_swap'
+                swapTx = 'no_swap_direct_usdc'
+                usdcAmount = amountReceived / 1_000_000 //convert from base units
+                console.log(`Payment ${paymentId} direct USDC, skipping swap`)
+                // txSignature = 'direct_usdc_no_swap'
             } else {
                 // Swap SOL or other token to USDC
                 const inputMint = tokenReceived === 'SOL' ? SOL_MINT : tokenReceived
-                txSignature = await swapToUSDC(inputMint, amountReceived, derivationPath)
+                swapTx = await swapToUSDC(inputMint, amountReceived, derivationPath)
+                usdcAmount = Number(payment.amount_usdc)
+                // txSignature = await swapToUSDC(inputMint, amountReceived, derivationPath)
+            }
+
+            // Transfer USDC from deposit wallet to merchant payout wallet
+            let transferTx: string
+            if (process.env.MOCK_SWAP === 'true') {
+                console.log(`[MOCK] Simulating USDC transfer of ${usdcAmount} USDC to ${payment.payout_wallet}`)
+                transferTx = 'mock_transfer_tx_' + Date.now()
+            } else {
+                transferTx = await transferUSDCToMerchant(
+                    derivationPath,
+                    payment.payout_wallet,
+                    usdcAmount
+                )
             }
 
             // Mark as completed
@@ -60,14 +92,31 @@ export const swapWorker = new Worker<SwapJobData>(
                 [paymentId]
             )
 
+
             // Stop watching this address
             await unregisterAddressFromHelius(depositAddress)
 
-            console.log(`✅ Payment ${paymentId} completed. Swap tx: ${txSignature}`)
-            return { txSignature }
+            // Notify merchant if they have a webhook configured
+            if (payment.webhook_url) {
+                await notifyMerchant(payment.webhook_url, {
+                    event: 'payment.completed',
+                    payment_id: payment.id,
+                    order_id: payment.order_id,
+                    amount_usdc: usdcAmount,
+                    token_received: tokenReceived,
+                    amount_received: amountReceived,
+                    swap_tx: swapTx,
+                    transfer_tx: transferTx,
+                    timestamp: new Date().toISOString(),
+                })
+            }
+
+
+            console.log(`✅ Payment ${paymentId} fully completed.`)
+            return { swapTx, transferTx }
 
         } catch (err: any) {
-            console.error(`Swap failed for payment ${paymentId}:`, err.message)
+            console.error(`Payment ${paymentId} failed:`, err.message)
 
             // Mark as failed
             await pool.query(

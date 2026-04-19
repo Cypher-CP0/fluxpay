@@ -1,7 +1,6 @@
 import axios from 'axios'
 import {
     Connection,
-    Keypair,
     VersionedTransaction,
     clusterApiUrl,
 } from '@solana/web3.js'
@@ -23,6 +22,12 @@ export async function swapToUSDC(
     amountLamports: number, // amount in smallest unit
     derivationPath: string  // to re-derive the deposit wallet keypair
 ): Promise<string> {
+    // Mock swap for Devnet testing - Jupiter has no liquidity on Devnet
+    if (process.env.MOCK_SWAP === 'true') {
+        console.log(`[MOCK] Simulating Jupiter swap: ${amountLamports} lamports → USDC`)
+        await new Promise(res => setTimeout(res, 1000))
+        return 'mock_swap_tx_' + Date.now()
+    }
     const usdcMint = USDC_MINT[network]
     const mnemonic = process.env.MASTER_MNEMONIC!
 
@@ -40,7 +45,7 @@ export async function swapToUSDC(
     })
 
     const quote = quoteResponse.data
-    console.log(`Jupiter quote: ${JSON.stringify(quote.outAmount)} USDC out`)
+    console.log(`Jupiter quote received, output: ${quote.outAmount} USDC`)
 
     // Step 2: Get swap transaction from Jupiter
     const swapResponse = await axios.post(`${JUPITER_QUOTE_API}/swap`, {

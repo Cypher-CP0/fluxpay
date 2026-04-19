@@ -11,6 +11,7 @@
   "dependencies": {
     "@fastify/cors": "^9.0.1",
     "@jup-ag/api": "^6.0.48",
+    "@solana/spl-token": "^0.4.14",
     "@solana/web3.js": "^1.91.1",
     "axios": "^1.15.0",
     "bip39": "^3.1.0",

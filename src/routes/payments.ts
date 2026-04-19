@@ -32,7 +32,7 @@ export async function paymentRoutes(app: FastifyInstance) {
 
       const mnemonic = process.env.MASTER_MNEMONIC!
       const { address, derivationPath } = deriveDepositAddress(mnemonic, merchant.id, order_id)
-      const expiresAt = new Date(Date.now() + 15 * 60 * 1000)
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000)
 
       const result = await pool.query(
         `INSERT INTO payments

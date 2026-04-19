@@ -61,7 +61,11 @@ async function processHeliusEvent(event: any) {
     return
   }
 
-  console.log(`Payment detected: ${amountReceived} ${tokenReceived} for payment ${payment.id}`)
+  const displayAmount = tokenReceived === 'SOL'
+    ? amountReceived / 1_000_000_000
+    : amountReceived / 1_000_000
+
+  console.log(`Payment detected: ${displayAmount} ${tokenReceived} for payment ${payment.id}`)
 
   await pool.query(
     `UPDATE payments SET status = 'detected', amount_received = $1, token_received = $2 WHERE id = $3`,
