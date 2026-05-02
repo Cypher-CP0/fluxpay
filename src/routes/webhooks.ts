@@ -4,7 +4,7 @@ import { swapQueue } from '../services/swapWorker'
 
 const TOKEN_MINTS: Record<string, string> = {
   'So11111111111111111111111111111111111111112': 'SOL',
-  'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr': 'USDC',
+  '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU': 'USDC',
   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
   'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'USDT',
 }

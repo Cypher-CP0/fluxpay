@@ -4,6 +4,7 @@ import { authMiddleware } from '../middleware/auth'
 import { deriveDepositAddress } from '../services/wallet'
 import { registerAddressWithHelius } from '../services/helius'
 import { CreatePaymentBody } from '../types'
+import { getSolPrice } from '../services/price'
 
 export async function paymentRoutes(app: FastifyInstance) {
 
@@ -54,6 +55,7 @@ export async function paymentRoutes(app: FastifyInstance) {
         expires_at: payment.expires_at,
         status: payment.status,
         network: process.env.SOLANA_NETWORK,
+        sol_price_usd: await getSolPrice(),
       })
     }
   )
@@ -94,4 +96,11 @@ export async function paymentRoutes(app: FastifyInstance) {
       })
     }
   )
+
+  // GET /api/price/sol — returns current SOL price in USD
+  app.get('/price/sol', async (req, reply) => {
+    const price = await getSolPrice()
+    return reply.send({ sol_usd: price, cached: true })
+  })
+
 }
