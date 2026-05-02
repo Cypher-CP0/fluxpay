@@ -6,6 +6,7 @@ import { paymentRoutes } from './routes/payments'
 import { merchantRoutes } from './routes/merchants'
 import { webhookRoutes } from './routes/webhooks'
 import { swapWorker } from './services/swapWorker'
+import { merchantMeRoutes } from './routes/merchantMe'
 
 dotenv.config()
 
@@ -17,6 +18,7 @@ async function main() {
   await app.register(paymentRoutes, { prefix: '/api' })
   await app.register(merchantRoutes, { prefix: '/api' })
   await app.register(webhookRoutes)
+  await app.register(merchantMeRoutes, { prefix: '/api' })
 
   app.get('/health', async () => ({ status: 'ok', network: process.env.SOLANA_NETWORK }))
 
