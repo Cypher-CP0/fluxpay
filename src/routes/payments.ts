@@ -93,6 +93,7 @@ export async function paymentRoutes(app: FastifyInstance) {
         status: payment.status,
         expires_at: payment.expires_at,
         created_at: payment.created_at,
+        sol_price_usd: await getSolPrice(),
       })
     }
   )
