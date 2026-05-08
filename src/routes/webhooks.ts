@@ -4,7 +4,7 @@ import { swapQueue } from '../services/swapWorker'
 
 const TOKEN_MINTS: Record<string, string> = {
   'So11111111111111111111111111111111111111112': 'SOL',
-  '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU': 'USDC',
+  'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr': 'USDC',
   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
   'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'USDT',
 }
@@ -51,6 +51,7 @@ async function processHeliusEvent(event: any) {
   let amountReceived: number
 
   if (tokenTransfer) {
+    console.log('Raw tokenTransfer:', JSON.stringify(tokenTransfer))
     tokenReceived = TOKEN_MINTS[tokenTransfer.mint] ?? tokenTransfer.mint
     amountReceived = tokenTransfer.tokenAmount
   } else if (solTransfer) {
@@ -63,7 +64,7 @@ async function processHeliusEvent(event: any) {
 
   const displayAmount = tokenReceived === 'SOL'
     ? amountReceived / 1_000_000_000
-    : amountReceived / 1_000_000
+    : amountReceived
 
   console.log(`Payment detected: ${displayAmount} ${tokenReceived} for payment ${payment.id}`)
 

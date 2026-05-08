@@ -20,6 +20,11 @@ export async function authMiddleware(
     return reply.status(401).send({ error: 'Invalid API key' })
   }
 
+  const merchant = result.rows[0]
+
+  // Log merchant info for debugging
+  console.log(`🔑 Merchant authenticated: ${merchant.name} | payout_wallet: ${merchant.payout_wallet}`)
+
   // Attach merchant to request so routes can use it
-  ;(req as any).merchant = result.rows[0]
+  ;(req as any).merchant = merchant
 }

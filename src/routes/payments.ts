@@ -18,6 +18,12 @@ export async function paymentRoutes(app: FastifyInstance) {
       if (!order_id || !amount_usdc || amount_usdc <= 0) {
         return reply.status(400).send({ error: 'order_id and amount_usdc are required' })
       }
+      // Block payment creation if merchant hasn't set a payout wallet
+      if (!merchant.payout_wallet) {
+        return reply.status(400).send({
+          error: 'Payout wallet not configured. Please set your payout wallet in dashboard settings before accepting payments.'
+        })
+      }
 
       const existing = await pool.query(
         'SELECT id, status FROM payments WHERE merchant_id = $1 AND order_id = $2',
