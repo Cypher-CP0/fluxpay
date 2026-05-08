@@ -1,78 +1,86 @@
 import axios from 'axios'
 import {
-    Connection,
-    VersionedTransaction,
-    clusterApiUrl,
+  Connection,
+  VersionedTransaction,
+  clusterApiUrl,
 } from '@solana/web3.js'
 import { deriveKeypairFromPath } from './wallet'
 
-// USDC mint address on devnet and mainnet
 const USDC_MINT: Record<string, string> = {
-    devnet: 'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr', // devnet USDC (fake)
-    'mainnet-beta': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // real USDC
+  devnet: 'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr',
+  'mainnet-beta': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
 }
 
-const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6'
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY!
+const JUPITER_BASE = 'https://api.jup.ag/swap/v2'
 
 const network = (process.env.SOLANA_NETWORK as 'devnet' | 'mainnet-beta') || 'devnet'
 const connection = new Connection(clusterApiUrl(network), 'confirmed')
 
 export async function swapToUSDC(
-    inputMint: string,   // token the user sent
-    amountLamports: number, // amount in smallest unit
-    derivationPath: string  // to re-derive the deposit wallet keypair
+  inputMint: string,
+  amountLamports: number,
+  derivationPath: string
 ): Promise<string> {
-    // Mock swap for Devnet testing - Jupiter has no liquidity on Devnet
-    if (process.env.MOCK_SWAP === 'true') {
-        console.log(`[MOCK] Simulating Jupiter swap: ${amountLamports} lamports → USDC`)
-        await new Promise(res => setTimeout(res, 1000))
-        return 'mock_swap_tx_' + Date.now()
+  if (process.env.MOCK_SWAP === 'true') {
+    console.log(`[MOCK] Simulating Jupiter swap: ${amountLamports} lamports → USDC`)
+    await new Promise(res => setTimeout(res, 1000))
+    return 'mock_swap_tx_' + Date.now()
+  }
+
+  const usdcMint = USDC_MINT[network]
+  const mnemonic = process.env.MASTER_MNEMONIC!
+  const keypair = deriveKeypairFromPath(mnemonic, derivationPath)
+
+  // Step 1: Get order (quote + assembled transaction)
+  const params = new URLSearchParams({
+    inputMint,
+    outputMint: usdcMint,
+    amount: String(amountLamports),
+    slippageBps: '50',
+    taker: keypair.publicKey.toBase58(),
+  })
+
+  const orderResponse = await axios.get(`${JUPITER_BASE}/order?${params}`, {
+    headers: { 'x-api-key': JUPITER_API_KEY },
+  })
+
+  const order = orderResponse.data
+
+  if (!order.transaction) {
+    throw new Error(`Jupiter order returned no transaction: ${JSON.stringify(order)}`)
+  }
+
+  console.log(`Jupiter order received — router: ${order.router}, outAmount: ${order.outAmount}`)
+
+  // Step 2: Partially sign — JupiterZ RFQ requires MM signature added during /execute
+  const swapTransactionBuf = Buffer.from(order.transaction, 'base64')
+  const versionedTx = VersionedTransaction.deserialize(swapTransactionBuf)
+  versionedTx.sign([keypair])
+
+  // Step 3: Execute via Jupiter's managed landing pipeline
+  const executeResponse = await axios.post(
+    `${JUPITER_BASE}/execute`,
+    {
+      signedTransaction: Buffer.from(versionedTx.serialize()).toString('base64'),
+      requestId: order.requestId,
+    },
+    {
+      headers: {
+        'x-api-key': JUPITER_API_KEY,
+        'Content-Type': 'application/json',
+      },
     }
-    const usdcMint = USDC_MINT[network]
-    const mnemonic = process.env.MASTER_MNEMONIC!
+  )
 
-    // Re-derive the keypair for the deposit wallet (this wallet holds the received funds)
-    const keypair = deriveKeypairFromPath(mnemonic, derivationPath)
+  const result = executeResponse.data
 
-    // Step 1: Get quote from Jupiter
-    const quoteResponse = await axios.get(`${JUPITER_QUOTE_API}/quote`, {
-        params: {
-            inputMint,
-            outputMint: usdcMint,
-            amount: amountLamports,
-            slippageBps: 50, // 0.5% slippage tolerance
-        },
-    })
+  if (result.status !== 'Success') {
+    throw new Error(`Jupiter swap failed — status: ${result.status}, code: ${result.code}, error: ${result.error}`)
+  }
 
-    const quote = quoteResponse.data
-    console.log(`Jupiter quote received, output: ${quote.outAmount} USDC`)
+  console.log(`✅ Jupiter swap confirmed: ${result.signature}`)
+  console.log(`   Input: ${result.inputAmountResult} | Output: ${result.outputAmountResult} USDC`)
 
-    // Step 2: Get swap transaction from Jupiter
-    const swapResponse = await axios.post(`${JUPITER_QUOTE_API}/swap`, {
-        quoteResponse: quote,
-        userPublicKey: keypair.publicKey.toBase58(),
-        wrapAndUnwrapSol: true, // handles SOL <-> wSOL automatically
-    })
-
-    const { swapTransaction } = swapResponse.data
-
-    // Step 3: Deserialize, sign, and send the transaction
-    const swapTransactionBuf = Buffer.from(swapTransaction, 'base64')
-    const transaction = VersionedTransaction.deserialize(swapTransactionBuf)
-    transaction.sign([keypair])
-
-    const txid = await connection.sendRawTransaction(transaction.serialize(), {
-        skipPreflight: true,
-        maxRetries: 3,
-    })
-
-    // Step 4: Wait for confirmation
-    const latestBlockhash = await connection.getLatestBlockhash()
-    await connection.confirmTransaction(
-        { signature: txid, ...latestBlockhash },
-        'confirmed'
-    )
-
-    console.log(`✅ Swap confirmed: ${txid}`)
-    return txid
+  return result.signature
 }

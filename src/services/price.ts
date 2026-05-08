@@ -14,7 +14,9 @@ export async function getSolPrice(): Promise<number> {
     try {
         // Jupiter price API — most accurate for Solana swaps
         const res = await axios.get(
-            'https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112'
+            'https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112',
+            { headers: { 'x-api-key': process.env.JUPITER_API_KEY! } }
+
         )
         const price = res.data?.data?.['So11111111111111111111111111111111111111112']?.price
         if (price) {
