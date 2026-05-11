@@ -1,26 +1,24 @@
 # FluxPay ⚡
 
-A Solana-based stablecoin payment gateway. Merchants accept payments in USDC/USDT while users can pay with SOL or any supported token — auto-converted via Jupiter DEX.
+A Solana-based stablecoin payment gateway. Merchants accept payments in USDC/USDT while users can pay with SOL or any supported token — auto-converted via Jupiter DEX (just for MVP ofc).
 
-Built for [Colosseum Hackathon 2026](https://colosseum.org).
+Built for [Colosseum Solana Frontier Hackathon 2026](https://colosseum.com/frontier).
 
 ---
 
+## Demo
+
+
+
+https://github.com/user-attachments/assets/c60b8ab5-e1a6-4b49-b992-a049c9d2c92a
+
+
+
+
 ## How it works
 
-```
-Merchant creates order → FluxPay derives unique deposit address (HD wallet)
-                                        ↓
-                    User sends SOL/USDC to deposit address
-                                        ↓
-                    Helius detects on-chain transaction (webhook)
-                                        ↓
-                    Jupiter swaps SOL → USDC automatically
-                                        ↓
-                    USDC transferred to merchant's payout wallet
-                                        ↓
-                    Merchant notified via webhook
-```
+<img width="2879" height="3338" alt="584735455-ca54c380-6b28-4f29-a6d4-03e50df59e9b" src="https://github.com/user-attachments/assets/98b5fcbc-b1af-42e7-a506-380027d88587" />
+
 
 No shared addresses. Every order gets its own unique deposit wallet derived from a master seed — child private keys are never stored.
 
