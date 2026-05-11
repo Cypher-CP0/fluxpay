@@ -21,58 +21,70 @@ const network = (process.env.SOLANA_NETWORK as 'devnet' | 'mainnet-beta') || 'de
 const connection = new Connection(clusterApiUrl(network), 'confirmed')
 
 export async function transferUSDCToMerchant(
-    derivationPath: string,   // to re-derive deposit wallet keypair
-    merchantPayoutWallet: string,  // merchant's configured wallet
-    amountUsdc: number        // amount in USDC (human readable, e.g. 10.5)
+    derivationPath: string,
+    merchantPayoutWallet: string,
+    amountUsdc: number
 ): Promise<string> {
     const mnemonic = process.env.MASTER_MNEMONIC!
     const usdcMint = new PublicKey(USDC_MINT[network])
 
-    // Re-derive the deposit wallet keypair (this holds the USDC after swap)
     const depositKeypair = deriveKeypairFromPath(mnemonic, derivationPath)
     const merchantPublicKey = new PublicKey(merchantPayoutWallet)
 
-    // Get USDC mint info to determine decimals (USDC = 6 decimals)
-    const mintInfo = await getMint(connection, usdcMint)
-    const amountInSmallestUnit = Math.floor(amountUsdc * Math.pow(10, mintInfo.decimals))
+    console.log(`Transferring ${amountUsdc} USDC`)
+    console.log(`From deposit wallet: ${depositKeypair.publicKey.toBase58()}`)
+    console.log(`To merchant wallet: ${merchantPayoutWallet}`)
+    console.log(`Using mint: ${USDC_MINT[network]}`)
+    console.log(`Network: ${network}`)
 
-    // Get or create the Associated Token Account (ATA) for the deposit wallet
-    // ATA is where SPL tokens like USDC are actually held
-    const fromTokenAccount = await getOrCreateAssociatedTokenAccount(
-        connection,
-        depositKeypair,       // payer for account creation if needed
-        usdcMint,
-        depositKeypair.publicKey
-    )
+    try {
+        const mintInfo = await getMint(connection, usdcMint)
+        const amountInSmallestUnit = Math.floor(amountUsdc * Math.pow(10, mintInfo.decimals))
+        console.log(`Amount in smallest unit: ${amountInSmallestUnit}`)
 
-    // Get or create the ATA for the merchant's wallet
-    const toTokenAccount = await getOrCreateAssociatedTokenAccount(
-        connection,
-        depositKeypair,       // deposit wallet pays for merchant ATA creation if needed
-        usdcMint,
-        merchantPublicKey
-    )
+        const fromTokenAccount = await getOrCreateAssociatedTokenAccount(
+            connection,
+            depositKeypair,
+            usdcMint,
+            depositKeypair.publicKey
+        )
 
-    // Build the transfer instruction
-    const transferInstruction = createTransferInstruction(
-        fromTokenAccount.address,  // source ATA
-        toTokenAccount.address,    // destination ATA
-        depositKeypair.publicKey,  // owner of source
-        amountInSmallestUnit
-    )
+        const toTokenAccount = await getOrCreateAssociatedTokenAccount(
+            connection,
+            depositKeypair,
+            usdcMint,
+            merchantPublicKey
+        )
 
-    const transaction = new Transaction().add(transferInstruction)
+        console.log(`From ATA: ${fromTokenAccount.address.toBase58()}`)
+        console.log(`To ATA: ${toTokenAccount.address.toBase58()}`)
+        console.log(`From ATA balance: ${fromTokenAccount.amount}`)
 
-    // Sign and send
-    const txSignature = await sendAndConfirmTransaction(
-        connection,
-        transaction,
-        [depositKeypair],
-        { commitment: 'confirmed' }
-    )
+        const transferInstruction = createTransferInstruction(
+            fromTokenAccount.address,
+            toTokenAccount.address,
+            depositKeypair.publicKey,
+            amountInSmallestUnit
+        )
 
-    console.log(`✅ USDC transfer confirmed: ${txSignature}`)
-    console.log(`   ${amountUsdc} USDC → ${merchantPayoutWallet}`)
+        const transaction = new Transaction().add(transferInstruction)
 
-    return txSignature
+        const txSignature = await sendAndConfirmTransaction(
+            connection,
+            transaction,
+            [depositKeypair],
+            { commitment: 'confirmed' }
+        )
+
+        console.log(`✅ USDC transfer confirmed: ${txSignature}`)
+        console.log(`   ${amountUsdc} USDC → ${merchantPayoutWallet}`)
+
+        return txSignature
+
+    } catch (err: any) {
+        console.error('transferUSDCToMerchant error:', err?.message)
+        console.error('transferUSDCToMerchant logs:', err?.logs)
+        console.error('Full transfer error:', JSON.stringify(err, null, 2))
+        throw err
+    }
 }
