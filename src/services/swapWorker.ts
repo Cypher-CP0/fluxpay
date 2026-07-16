@@ -3,6 +3,7 @@ import { redis } from '../db/redis'
 import { pool } from '../db'
 import { swapToUSDC } from './jupiter'
 import { transferUSDCToMerchant } from './tansfer'
+import { releaseEscrow } from './escrow'
 import { notifyMerchant } from './notify'
 import { unregisterAddressFromHelius } from './helius'
 
@@ -16,7 +17,7 @@ const USDC_MINT: Record<string, string> = {
 export interface SwapJobData {
   paymentId: string
   depositAddress: string
-  derivationPath: string
+  derivationPath: string | null // null for escrow (USDC/USDT) payments
   tokenReceived: string
   amountReceived: number
 }
@@ -33,7 +34,6 @@ export const swapWorker = new Worker<SwapJobData>(
 
     console.log(`Processing ${jobType} job for payment ${paymentId}`)
 
-    // Use 'transferring' for stablecoins, 'swapping' for SOL
     await pool.query(
       `UPDATE payments SET status = $1 WHERE id = $2`,
       [isStablecoin ? 'transferring' : 'swapping', paymentId]
@@ -56,19 +56,54 @@ export const swapWorker = new Worker<SwapJobData>(
       let usdcAmount: number = 0
 
       if (isStablecoin) {
-        // Direct stablecoin — no swap needed, always do real transfer
+        // Direct stablecoin — no swap needed.
         usdcAmount = amountReceived
         swapTx = `direct_${tokenReceived.toLowerCase()}_no_swap`
 
-        console.log(`Direct ${tokenReceived} payment of ${usdcAmount} to ${payment.payout_wallet}`)
-        transferTx = await transferUSDCToMerchant(
-          derivationPath,
-          payment.payout_wallet,
-          usdcAmount
-        )
+        if (payment.escrow_used) {
+          // ── Escrow path: release funds from the on-chain escrow to merchant ──
+          console.log(`Releasing escrow for payment ${paymentId}`)
+          try {
+            const { txSignature } = await releaseEscrow({
+              paymentUuid: paymentId,
+              merchantPayoutWallet: payment.payout_wallet,
+            })
+            transferTx = txSignature
+          } catch (err: any) {
+            // If the release window (payment_window + grace) has passed, the
+            // escrow can no longer be released — the customer must self-refund
+            // on-chain. Mark 'expired', NOT 'failed' (they mean different things:
+            // expired = recoverable by customer; failed = something broke).
+            if (
+              err?.message?.includes('ReleaseWindowPassed') ||
+              err?.error?.errorMessage?.includes('release window')
+            ) {
+              await pool.query(
+                "UPDATE payments SET status = 'expired' WHERE id = $1",
+                [paymentId]
+              )
+              await unregisterAddressFromHelius(depositAddress)
+              console.log(
+                `Payment ${paymentId} release window passed — funds remain in escrow, ` +
+                  `customer can self-refund on-chain after grace period.`
+              )
+              return { swapTx, transferTx: 'release_window_passed' }
+            }
+            throw err // any other error → genuine failure, handled by outer catch
+          }
+        } else {
+          // ── Legacy path: HD-wallet direct transfer (payments created before
+          //    escrow migration, or if escrow was somehow skipped) ──
+          console.log(`Direct ${tokenReceived} payment of ${usdcAmount} to ${payment.payout_wallet}`)
+          transferTx = await transferUSDCToMerchant(
+            derivationPath!,
+            payment.payout_wallet,
+            usdcAmount
+          )
+        }
 
       } else {
-        // SOL or other token — swap to USDC first
+        // SOL or other token — swap to USDC first (unchanged, HD-wallet flow).
         const inputMint = tokenReceived === 'SOL' ? SOL_MINT : tokenReceived
         usdcAmount = Number(payment.amount_usdc)
 
@@ -78,9 +113,9 @@ export const swapWorker = new Worker<SwapJobData>(
           console.log(`[MOCK] Simulating USDC transfer of ${usdcAmount} USDC to ${payment.payout_wallet}`)
           transferTx = 'mock_transfer_tx_' + Date.now()
         } else {
-          swapTx = await swapToUSDC(inputMint, amountReceived, derivationPath)
+          swapTx = await swapToUSDC(inputMint, amountReceived, derivationPath!)
           transferTx = await transferUSDCToMerchant(
-            derivationPath,
+            derivationPath!,
             payment.payout_wallet,
             usdcAmount
           )

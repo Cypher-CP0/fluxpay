@@ -42,9 +42,17 @@ async function processHeliusEvent(event: any) {
   if (result.rows.length === 0) return
 
   const payment = result.rows[0]
+
+  if (!payment.escrow_used && !payment.derivation_path) {
+  console.error(`Payment ${payment.id} has no derivation_path and isn't escrow — cannot process`)
+  return
+  }
+
   const depositAddress = payment.deposit_address
 
-  const tokenTransfer = tokenTransfers.find((t: any) => t.toUserAccount === depositAddress)
+  const tokenTransfer = tokenTransfers.find(
+    (t: any) => t.toTokenAccount === depositAddress || t.toUserAccount === depositAddress
+  )
   const solTransfer = nativeTransfers.find((t: any) => t.toUserAccount === depositAddress)
 
   let tokenReceived: string
