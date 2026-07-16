@@ -13,12 +13,21 @@ export async function initDB() {
   try {
     await client.query(`
       CREATE TABLE IF NOT EXISTS merchants (
-        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        name          TEXT NOT NULL,
-        api_key       TEXT NOT NULL UNIQUE,
-        payout_wallet TEXT NOT NULL,
-        webhook_url   TEXT,
-        created_at    TIMESTAMPTZ DEFAULT NOW()
+        id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        merchant_id      UUID NOT NULL REFERENCES merchants(id),
+        order_id         TEXT NOT NULL,
+        deposit_address  TEXT UNIQUE,
+        derivation_path  TEXT,
+        amount_usdc      NUMERIC(18, 6) NOT NULL,
+        amount_received  NUMERIC(18, 6),
+        token_received   TEXT,
+        token_selected   TEXT,
+        escrow_used      BOOLEAN DEFAULT FALSE,
+        escrow_pda       TEXT,
+        status           TEXT NOT NULL DEFAULT 'pending',
+        expires_at       TIMESTAMPTZ NOT NULL,
+        created_at       TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(merchant_id, order_id)
       );
 
       CREATE TABLE IF NOT EXISTS payments (
