@@ -50,6 +50,9 @@ export async function initDB() {
 
       CREATE INDEX IF NOT EXISTS idx_payments_status
         ON payments(status);
+        
+      CREATE INDEX IF NOT EXISTS idx_processed_webhooks_signature
+        ON processed_webhooks(signature);
     `)
     console.log('✅ DB schema ready')
   } finally {

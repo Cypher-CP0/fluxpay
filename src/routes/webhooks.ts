@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify'
 import { pool } from '../db'
 import { swapQueue } from '../services/swapWorker'
+import { claimWebhook } from '../services/idempotency'
 
 const TOKEN_MINTS: Record<string, string> = {
   'So11111111111111111111111111111111111111112': 'SOL',
@@ -30,6 +31,7 @@ async function processHeliusEvent(event: any) {
   const accountData: any[] = event.accountData ?? []
   const tokenTransfers: any[] = event.tokenTransfers ?? []
   const nativeTransfers: any[] = event.nativeTransfers ?? []
+  const signature = event.signature ?? ''
 
   const affectedAddresses = accountData.map((a: any) => a.account)
   if (affectedAddresses.length === 0) return
@@ -69,6 +71,16 @@ async function processHeliusEvent(event: any) {
     console.log(`Event for ${depositAddress} but no relevant transfer found`)
     return
   }
+  // ── Idempotency guard ─────────────────────────────────────────────────────
+  // Claim this webhook by its transaction signature BEFORE enqueuing, so a
+  // duplicate Helius delivery (retry, re-send) can't enqueue a second job for
+  // the same on-chain deposit. Dual-layer: Redis fast + Postgres durable.
+
+  const isNew = await claimWebhook(signature, payment.id)
+  if (!isNew) {
+    console.log(`Duplicate webhook for signature ${signature} (payment ${payment.id}) — skipping`)
+    return
+  }
 
   const displayAmount = tokenReceived === 'SOL'
     ? amountReceived / 1_000_000_000
@@ -76,10 +88,15 @@ async function processHeliusEvent(event: any) {
 
   console.log(`Payment detected: ${displayAmount} ${tokenReceived} for payment ${payment.id}`)
 
-  await pool.query(
-    `UPDATE payments SET status = 'detected', amount_received = $1, token_received = $2 WHERE id = $3`,
+  const claimed = await pool.query(
+    `UPDATE payments SET status = 'detected', amount_received = $1, token_received = $2
+      WHERE id = $3 AND status = 'pending'`,
     [amountReceived, tokenReceived, payment.id]
   )
+  if (claimed.rowCount === 0) {
+    console.log(`Payment ${payment.id} already claimed by reconciliation — skipping`)
+    return
+  }
 
   await swapQueue.add(
     'swap',

@@ -6,6 +6,7 @@ import { paymentRoutes } from './routes/payments'
 import { merchantRoutes } from './routes/merchants'
 import { webhookRoutes } from './routes/webhooks'
 import { swapWorker } from './services/swapWorker'
+import { reconcileWorker, scheduleReconciliation } from './services/reconcileWorker'
 import { merchantMeRoutes } from './routes/merchantMe'
 
 dotenv.config()
@@ -28,6 +29,11 @@ async function main() {
   console.log('✅ Swap worker started')
   // swapWorker is imported and starts automatically on import
 
+  // Reconciliation safety net — catches deposits the Helius webhook path
+  // missed, by checking on-chain escrow state independently. reconcileWorker
+  // starts consuming on import; scheduleReconciliation registers the
+  // repeatable job (survives restarts, since BullMQ persists it in Redis).
+  await scheduleReconciliation()
   const port = Number(process.env.PORT) || 3000
   await app.listen({ port, host: '0.0.0.0' })
   console.log(`🚀 FluxPay running on port ${port}`)
