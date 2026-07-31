@@ -13,7 +13,8 @@ const connection = new Connection(clusterApiUrl(network), 'confirmed')
 // path, which should handle the vast majority within seconds.
 const MIN_AGE_SECONDS = 30
 
-export const reconcileQueue = new Queue('reconcile', { connection: redis })
+import { reconcileQueue } from './queues'
+export { reconcileQueue }
 
 /**
  * Reconciliation safety net. Runs on a repeatable schedule and independently

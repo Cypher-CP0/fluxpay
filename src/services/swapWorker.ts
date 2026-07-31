@@ -8,6 +8,12 @@ import { classifyReleaseFailure } from './verification'
 import { recordDeadLetter, resolveDeadLettersForPayment } from './deadLetter'
 import { notifyMerchant } from './notify'
 import { unregisterAddressFromHelius } from './helius'
+import { swapQueue, SwapJobData } from './queues'
+
+
+
+export { swapQueue }
+export type { SwapJobData }
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 
@@ -16,17 +22,10 @@ const USDC_MINT: Record<string, string> = {
   'mainnet-beta': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
 }
 
-export interface SwapJobData {
-  paymentId: string
-  depositAddress: string
-  derivationPath: string | null // null for escrow (USDC/USDT) payments
-  tokenReceived: string
-  amountReceived: number
-}
+/** Statuses from which no further processing is meaningful. */
+const TERMINAL_STATUSES = ['completed', 'expired', 'refunded']
 
-export const swapQueue = new Queue<SwapJobData>('swap', { connection: redis })
 
-const MAX_ATTEMPTS = 3
 
 /** True when this is the last attempt BullMQ will make for this job. */
 function isFinalAttempt(job: Job): boolean {
@@ -48,11 +47,9 @@ export const swapWorker = new Worker<SwapJobData>(
 
     console.log(`Processing ${jobType} job for payment ${paymentId}`)
 
-    await pool.query(
-      `UPDATE payments SET status = $1 WHERE id = $2`,
-      [isStablecoin ? 'transferring' : 'swapping', paymentId]
-    )
-
+    // Read before writing. The old order updated the status first, which meant
+    // a job for an already-settled payment clobbered its terminal status with
+    // 'transferring' before anything had a chance to notice.
     const result = await pool.query(
       `SELECT p.*, m.payout_wallet, m.webhook_url
        FROM payments p
@@ -64,12 +61,47 @@ export const swapWorker = new Worker<SwapJobData>(
     if (result.rows.length === 0) throw new Error(`Payment ${paymentId} not found`)
     const payment = result.rows[0]
 
-    /** Shared success path — used both by a normal completion and by the
-     *  'already settled' case, where the merchant was in fact paid and simply
-     *  needs the same bookkeeping a first-attempt success would have done. */
+    // A job arriving for a payment that has already settled is a replay or a
+    // duplicate. There is nothing left to do, and proceeding would both
+    // overwrite the terminal status and risk a second merchant notification.
+    if (TERMINAL_STATUSES.includes(payment.status)) {
+      console.log(`Payment ${paymentId} is already ${payment.status} — nothing to do`)
+      return { swapTx: 'n/a', transferTx: `already_${payment.status}` }
+    }
+
+    await pool.query(
+      `UPDATE payments SET status = $1 WHERE id = $2`,
+      [isStablecoin ? 'transferring' : 'swapping', paymentId]
+    )
+
+    /**
+     * Shared success path — used both by a normal completion and by the
+     * 'already_settled' case, where the merchant was in fact paid and simply
+     * needs the same bookkeeping a first-attempt success would have done.
+     *
+     * The status transition is conditional on the payment not already being
+     * completed, so this can run more than once for the same payment without
+     * notifying the merchant twice. A duplicate payment.completed is worse
+     * than it sounds: a naive integration may fulfil the order again.
+     */
     const settleAsCompleted = async (swapTx: string, transferTx: string, usdcAmount: number) => {
-      await pool.query("UPDATE payments SET status = 'completed' WHERE id = $1", [paymentId])
+      const transitioned = await pool.query(
+        `UPDATE payments SET status = 'completed'
+          WHERE id = $1 AND status <> 'completed'`,
+        [paymentId]
+      )
+
+      // Cheap and idempotent, so it runs either way — if an earlier completion
+      // died partway through, this gives the cleanup another chance.
       await unregisterAddressFromHelius(depositAddress)
+
+      if (transitioned.rowCount === 0) {
+        console.log(
+          `Payment ${paymentId} was already completed — skipping duplicate merchant notification`
+        )
+        return
+      }
+
       await resolveDeadLettersForPayment(paymentId)
 
       if (payment.webhook_url) {
@@ -175,6 +207,15 @@ export const swapWorker = new Worker<SwapJobData>(
             `Payment ${paymentId} expired — funds remain in escrow for customer refund`
           )
           return { swapTx: 'n/a', transferTx: 'release_window_passed' }
+        }
+
+        case 'terminal_refunded': {
+          // The customer reclaimed their deposit. Terminal, and not a payment
+          // to the merchant — retrying could never produce one.
+          await pool.query("UPDATE payments SET status = 'refunded' WHERE id = $1", [paymentId])
+          await unregisterAddressFromHelius(depositAddress)
+          console.log(`Payment ${paymentId} was refunded to the customer`)
+          return { swapTx: 'n/a', transferTx: 'refunded' }
         }
 
         case 'terminal_failed': {

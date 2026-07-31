@@ -1,5 +1,5 @@
 import { pool } from '../db'
-import { swapQueue, SwapJobData } from './swapWorker'
+import { SwapJobData, swapQueue } from './queues'
 
 /**
  * Records a job that exhausted its BullMQ retries.
