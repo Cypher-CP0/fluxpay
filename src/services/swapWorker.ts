@@ -1,11 +1,19 @@
-import { Worker, Queue } from 'bullmq'
+import { Worker, Queue, Job } from 'bullmq'
 import { redis } from '../db/redis'
 import { pool } from '../db'
 import { swapToUSDC } from './jupiter'
 import { transferUSDCToMerchant } from './tansfer'
 import { releaseEscrow } from './escrow'
+import { classifyReleaseFailure } from './verification'
+import { recordDeadLetter, resolveDeadLettersForPayment } from './deadLetter'
 import { notifyMerchant } from './notify'
 import { unregisterAddressFromHelius } from './helius'
+import { swapQueue, SwapJobData } from './queues'
+
+
+
+export { swapQueue }
+export type { SwapJobData }
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 
@@ -14,15 +22,20 @@ const USDC_MINT: Record<string, string> = {
   'mainnet-beta': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
 }
 
-export interface SwapJobData {
-  paymentId: string
-  depositAddress: string
-  derivationPath: string | null // null for escrow (USDC/USDT) payments
-  tokenReceived: string
-  amountReceived: number
-}
+/** Statuses from which no further processing is meaningful. */
+const TERMINAL_STATUSES = ['completed', 'expired', 'refunded']
 
-export const swapQueue = new Queue<SwapJobData>('swap', { connection: redis })
+
+
+/** True when this is the last attempt BullMQ will make for this job. */
+function isFinalAttempt(job: Job): boolean {
+  const configured = job.opts?.attempts ?? 1
+  // attemptsMade counts attempts already completed, so the current attempt is
+  // number attemptsMade + 1. Compare defensively — the exact semantics have
+  // shifted across BullMQ versions, and over-reporting a final attempt is far
+  // less harmful than never recording a dead letter at all.
+  return job.attemptsMade + 1 >= configured
+}
 
 export const swapWorker = new Worker<SwapJobData>(
   'swap',
@@ -34,11 +47,9 @@ export const swapWorker = new Worker<SwapJobData>(
 
     console.log(`Processing ${jobType} job for payment ${paymentId}`)
 
-    await pool.query(
-      `UPDATE payments SET status = $1 WHERE id = $2`,
-      [isStablecoin ? 'transferring' : 'swapping', paymentId]
-    )
-
+    // Read before writing. The old order updated the status first, which meant
+    // a job for an already-settled payment clobbered its terminal status with
+    // 'transferring' before anything had a chance to notice.
     const result = await pool.query(
       `SELECT p.*, m.payout_wallet, m.webhook_url
        FROM payments p
@@ -50,50 +61,81 @@ export const swapWorker = new Worker<SwapJobData>(
     if (result.rows.length === 0) throw new Error(`Payment ${paymentId} not found`)
     const payment = result.rows[0]
 
+    // A job arriving for a payment that has already settled is a replay or a
+    // duplicate. There is nothing left to do, and proceeding would both
+    // overwrite the terminal status and risk a second merchant notification.
+    if (TERMINAL_STATUSES.includes(payment.status)) {
+      console.log(`Payment ${paymentId} is already ${payment.status} — nothing to do`)
+      return { swapTx: 'n/a', transferTx: `already_${payment.status}` }
+    }
+
+    await pool.query(
+      `UPDATE payments SET status = $1 WHERE id = $2`,
+      [isStablecoin ? 'transferring' : 'swapping', paymentId]
+    )
+
+    /**
+     * Shared success path — used both by a normal completion and by the
+     * 'already_settled' case, where the merchant was in fact paid and simply
+     * needs the same bookkeeping a first-attempt success would have done.
+     *
+     * The status transition is conditional on the payment not already being
+     * completed, so this can run more than once for the same payment without
+     * notifying the merchant twice. A duplicate payment.completed is worse
+     * than it sounds: a naive integration may fulfil the order again.
+     */
+    const settleAsCompleted = async (swapTx: string, transferTx: string, usdcAmount: number) => {
+      const transitioned = await pool.query(
+        `UPDATE payments SET status = 'completed'
+          WHERE id = $1 AND status <> 'completed'`,
+        [paymentId]
+      )
+
+      // Cheap and idempotent, so it runs either way — if an earlier completion
+      // died partway through, this gives the cleanup another chance.
+      await unregisterAddressFromHelius(depositAddress)
+
+      if (transitioned.rowCount === 0) {
+        console.log(
+          `Payment ${paymentId} was already completed — skipping duplicate merchant notification`
+        )
+        return
+      }
+
+      await resolveDeadLettersForPayment(paymentId)
+
+      if (payment.webhook_url) {
+        await notifyMerchant(payment.webhook_url, {
+          event: 'payment.completed',
+          payment_id: payment.id,
+          order_id: payment.order_id,
+          amount_usdc: usdcAmount,
+          token_received: tokenReceived,
+          amount_received: amountReceived,
+          swap_tx: swapTx,
+          transfer_tx: transferTx,
+          timestamp: new Date().toISOString(),
+        })
+      }
+    }
+
     try {
       let swapTx: string = ''
       let transferTx: string = ''
       let usdcAmount: number = 0
 
       if (isStablecoin) {
-        // Direct stablecoin — no swap needed.
         usdcAmount = amountReceived
         swapTx = `direct_${tokenReceived.toLowerCase()}_no_swap`
 
         if (payment.escrow_used) {
-          // ── Escrow path: release funds from the on-chain escrow to merchant ──
           console.log(`Releasing escrow for payment ${paymentId}`)
-          try {
-            const { txSignature } = await releaseEscrow({
-              paymentUuid: paymentId,
-              merchantPayoutWallet: payment.payout_wallet,
-            })
-            transferTx = txSignature
-          } catch (err: any) {
-            // If the release window (payment_window + grace) has passed, the
-            // escrow can no longer be released — the customer must self-refund
-            // on-chain. Mark 'expired', NOT 'failed' (they mean different things:
-            // expired = recoverable by customer; failed = something broke).
-            if (
-              err?.message?.includes('ReleaseWindowPassed') ||
-              err?.error?.errorMessage?.includes('release window')
-            ) {
-              await pool.query(
-                "UPDATE payments SET status = 'expired' WHERE id = $1",
-                [paymentId]
-              )
-              await unregisterAddressFromHelius(depositAddress)
-              console.log(
-                `Payment ${paymentId} release window passed — funds remain in escrow, ` +
-                  `customer can self-refund on-chain after grace period.`
-              )
-              return { swapTx, transferTx: 'release_window_passed' }
-            }
-            throw err // any other error → genuine failure, handled by outer catch
-          }
+          const { txSignature } = await releaseEscrow({
+            paymentUuid: paymentId,
+            merchantPayoutWallet: payment.payout_wallet,
+          })
+          transferTx = txSignature
         } else {
-          // ── Legacy path: HD-wallet direct transfer (payments created before
-          //    escrow migration, or if escrow was somehow skipped) ──
           console.log(`Direct ${tokenReceived} payment of ${usdcAmount} to ${payment.payout_wallet}`)
           transferTx = await transferUSDCToMerchant(
             derivationPath!,
@@ -101,9 +143,7 @@ export const swapWorker = new Worker<SwapJobData>(
             usdcAmount
           )
         }
-
       } else {
-        // SOL or other token — swap to USDC first (unchanged, HD-wallet flow).
         const inputMint = tokenReceived === 'SOL' ? SOL_MINT : tokenReceived
         usdcAmount = Number(payment.amount_usdc)
 
@@ -122,39 +162,100 @@ export const swapWorker = new Worker<SwapJobData>(
         }
       }
 
-      await pool.query(
-        "UPDATE payments SET status = 'completed' WHERE id = $1",
-        [paymentId]
-      )
-
-      await unregisterAddressFromHelius(depositAddress)
-
-      if (payment.webhook_url) {
-        await notifyMerchant(payment.webhook_url, {
-          event: 'payment.completed',
-          payment_id: payment.id,
-          order_id: payment.order_id,
-          amount_usdc: usdcAmount,
-          token_received: tokenReceived,
-          amount_received: amountReceived,
-          swap_tx: swapTx,
-          transfer_tx: transferTx,
-          timestamp: new Date().toISOString(),
-        })
-      }
+      await settleAsCompleted(swapTx, transferTx, usdcAmount)
 
       console.log(`✅ Payment ${paymentId} fully completed.`)
       return { swapTx, transferTx }
 
     } catch (err: any) {
-      console.error(`Payment ${paymentId} failed:`, err?.message ?? err)
+      const rawMessage = err?.message ?? String(err)
 
-      await pool.query(
-        "UPDATE payments SET status = 'failed' WHERE id = $1",
-        [paymentId]
+      // Consult the chain before deciding what this failure means. The error
+      // text alone can't distinguish "the release failed" from "the release
+      // already succeeded and this attempt was redundant" — and getting that
+      // wrong marks a paid merchant's payment as failed.
+      const verdict = await classifyReleaseFailure(err, {
+        id: paymentId,
+        escrow_pda: payment.escrow_pda,
+        escrow_used: payment.escrow_used,
+      })
+
+      console.error(
+        `Payment ${paymentId} release attempt failed [${verdict.class}]: ${verdict.reason}`
       )
 
-      throw err
+      switch (verdict.class) {
+        case 'already_settled': {
+          // The merchant has the money. The job failed; the payment did not.
+          console.log(
+            `✅ Payment ${paymentId} verified settled on-chain — recording as completed`
+          )
+          await settleAsCompleted(
+            `direct_${tokenReceived.toLowerCase()}_no_swap`,
+            verdict.signature ?? 'verified_on_chain',
+            amountReceived
+          )
+          return { swapTx: 'n/a', transferTx: verdict.signature ?? 'verified_on_chain' }
+        }
+
+        case 'terminal_expired': {
+          // Funds remain escrowed and the customer can refund themselves.
+          // Not a failure on our side, and retrying can never help.
+          await pool.query("UPDATE payments SET status = 'expired' WHERE id = $1", [paymentId])
+          await unregisterAddressFromHelius(depositAddress)
+          console.log(
+            `Payment ${paymentId} expired — funds remain in escrow for customer refund`
+          )
+          return { swapTx: 'n/a', transferTx: 'release_window_passed' }
+        }
+
+        case 'terminal_refunded': {
+          // The customer reclaimed their deposit. Terminal, and not a payment
+          // to the merchant — retrying could never produce one.
+          await pool.query("UPDATE payments SET status = 'refunded' WHERE id = $1", [paymentId])
+          await unregisterAddressFromHelius(depositAddress)
+          console.log(`Payment ${paymentId} was refunded to the customer`)
+          return { swapTx: 'n/a', transferTx: 'refunded' }
+        }
+
+        case 'terminal_failed': {
+          // Genuinely broken and retrying won't help. Record for a human.
+          await pool.query("UPDATE payments SET status = 'failed' WHERE id = $1", [paymentId])
+          await recordDeadLetter({
+            paymentId,
+            queueName: 'swap',
+            jobId: String(job.id),
+            jobData: job.data,
+            errorClass: verdict.class,
+            errorMessage: `${verdict.reason} | raw: ${rawMessage}`,
+            attemptsMade: job.attemptsMade + 1,
+          })
+          return { swapTx: 'n/a', transferTx: 'failed' }
+        }
+
+        case 'retryable':
+        case 'unknown':
+        default: {
+          if (isFinalAttempt(job)) {
+            // Automated recovery is exhausted. Hand it to a human rather than
+            // silently burying it in a 'failed' status with no context.
+            await pool.query("UPDATE payments SET status = 'failed' WHERE id = $1", [paymentId])
+            await recordDeadLetter({
+              paymentId,
+              queueName: 'swap',
+              jobId: String(job.id),
+              jobData: job.data,
+              errorClass: verdict.class,
+              errorMessage: `${verdict.reason} | raw: ${rawMessage}`,
+              attemptsMade: job.attemptsMade + 1,
+            })
+          }
+          // Throw so BullMQ retries with its configured backoff. Leave the
+          // status as 'transferring'/'swapping' between attempts — marking it
+          // 'failed' now would be premature while retries remain.
+          throw err
+        }
+      }
     }
   },
   {
@@ -168,5 +269,5 @@ swapWorker.on('completed', (job) => {
 })
 
 swapWorker.on('failed', (job, err) => {
-  console.error(`Job ${job?.id} failed:`, err.message)
+  console.error(`Job ${job?.id} failed (attempt ${job?.attemptsMade}):`, err.message)
 })

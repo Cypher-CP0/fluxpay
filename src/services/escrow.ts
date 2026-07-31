@@ -175,6 +175,22 @@ export async function createEscrow(params: {
  * window + grace period has expired — in that case the payment should be
  * marked failed/expired, not retried.
  */
+// ─────────────────────────────────────────────────────────────────────────────
+// REPLACE the existing releaseEscrow function in src/services/escrow.ts
+// with this version. Everything else in that file stays as-is.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Releases escrowed funds to the merchant. Call this once a deposit is
+ * confirmed in the vault.
+ *
+ * Deliberately does NOT use Anchor's .rpc() convenience method. .rpc() builds,
+ * sends and confirms in one call, and if confirmation times out it throws
+ * without reliably surfacing the signature — leaving us unable to check later
+ * whether the transaction actually landed. Since that ambiguity is exactly
+ * what causes a paid merchant's payment to be marked failed, we send and
+ * confirm separately and attach the signature to any confirmation error.
+ */
 export async function releaseEscrow(params: {
   paymentUuid: string
   merchantPayoutWallet: string
@@ -188,7 +204,7 @@ export async function releaseEscrow(params: {
   const merchantPubkey = new PublicKey(merchantPayoutWallet)
   const merchantTokenAccount = await getAssociatedTokenAddress(USDC_MINT, merchantPubkey)
 
-  const txSignature = await (program.methods as any)
+  const tx = await (program.methods as any)
     .release(paymentIdBytes)
     .accounts({
       config: configPda,
@@ -198,7 +214,33 @@ export async function releaseEscrow(params: {
       admin: adminKeypair.publicKey,
       tokenProgram: TOKEN_PROGRAM_ID,
     })
-    .rpc()
+    .transaction()
+
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash()
+  tx.recentBlockhash = blockhash
+  tx.feePayer = adminKeypair.publicKey
+  tx.sign(adminKeypair)
+
+  // If this throws, preflight rejected the transaction and nothing was sent —
+  // there is no signature to check, which the classifier handles by falling
+  // back to inspecting escrow account state.
+  const txSignature = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+  })
+
+  try {
+    await connection.confirmTransaction(
+      { signature: txSignature, blockhash, lastValidBlockHeight },
+      'confirmed'
+    )
+  } catch (err: any) {
+    // The transaction WAS sent. Whether it landed is unknown, so hand the
+    // signature to the caller — it turns an ambiguous failure into something
+    // verifiable rather than a guess.
+    err.signature = txSignature
+    throw err
+  }
 
   console.log(`✅ Escrow released for payment ${paymentUuid}`)
   console.log(`   ${merchantPayoutWallet} paid via escrow`)
